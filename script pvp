@@ -1,0 +1,1577 @@
+--[[
+    Darling X - Auto Combat Module
+    Automated PvP passives: Armament Haki (Buso), Race V3, and Race V4 Awakening.
+    Zero emojis, zero third-party references.
+    Strict gating: loop only runs while at least one combat passive is enabled.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+
+local AutoCombat = {
+    AutoBusoEnabled = false,
+    AutoV3Enabled = false,
+    AutoV4Enabled = false,
+
+    CombatThread = nil,
+}
+
+local function checkLoopGating()
+    local needLoop = AutoCombat.AutoBusoEnabled or AutoCombat.AutoV3Enabled or AutoCombat.AutoV4Enabled
+
+    if needLoop and not AutoCombat.CombatThread then
+        AutoCombat.CombatThread = task.spawn(function()
+            while AutoCombat.AutoBusoEnabled or AutoCombat.AutoV3Enabled or AutoCombat.AutoV4Enabled do
+                -- 1. Auto Buso Haki
+                if AutoCombat.AutoBusoEnabled then
+                    pcall(function()
+                        local char = LocalPlayer and LocalPlayer.Character
+                        if char and not char:FindFirstChild("HasBuso") then
+                            local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+                            local commF = remotes and (remotes:FindFirstChild("CommF_") or remotes:FindFirstChild("CommF"))
+                            if commF then
+                                commF:InvokeServer("Buso")
+                            end
+                        end
+                    end)
+                end
+
+                -- 2. Auto Race V3
+                if AutoCombat.AutoV3Enabled then
+                    pcall(function()
+                        local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+                        local commE = remotes and remotes:FindFirstChild("CommE")
+                        if commE then
+                            commE:FireServer("ActivateAbility")
+                        end
+                    end)
+                end
+
+                -- 3. Auto Race V4 Awakening
+                if AutoCombat.AutoV4Enabled then
+                    pcall(function()
+                        local awk = (LocalPlayer.Backpack and LocalPlayer.Backpack:FindFirstChild("Awakening"))
+                            or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Awakening"))
+                        if awk and awk:FindFirstChild("RemoteFunction") then
+                            awk.RemoteFunction:InvokeServer(true)
+                        end
+                    end)
+                end
+
+                task.wait(1.2)
+            end
+            AutoCombat.CombatThread = nil
+        end)
+    elseif not needLoop and AutoCombat.CombatThread then
+        pcall(task.cancel, AutoCombat.CombatThread)
+        AutoCombat.CombatThread = nil
+    end
+end
+
+function AutoCombat.SetAutoBuso(state)
+    AutoCombat.AutoBusoEnabled = (state == true)
+    _G.DarlingX_AutoBuso = AutoCombat.AutoBusoEnabled
+    checkLoopGating()
+end
+
+function AutoCombat.SetAutoV3(state)
+    AutoCombat.AutoV3Enabled = (state == true)
+    _G.DarlingX_AutoV3 = AutoCombat.AutoV3Enabled
+    checkLoopGating()
+end
+
+function AutoCombat.SetAutoV4(state)
+    AutoCombat.AutoV4Enabled = (state == true)
+    _G.DarlingX_AutoV4 = AutoCombat.AutoV4Enabled
+    checkLoopGating()
+end
+
+function AutoCombat.ResetAll()
+    AutoCombat.SetAutoBuso(false)
+    AutoCombat.SetAutoV3(false)
+    AutoCombat.SetAutoV4(false)
+end
+
+return AutoCombat
+--[[
+    Darling X - Camlock Module (Classic v2.5 / v2.6 Inspired Engine)
+    Clean, deterministic, user-controlled camera locking:
+    - Starts in OFF state when enabled in UI (LOCK: OFF).
+    - When turned ON (via widget or keybind C), locks onto the enemy currently in crosshairs/front.
+    - Stays locked onto that exact person until explicitly turned OFF.
+    - When turned OFF, camera returns to 100% normal immediately and stays normal.
+    - If the target dies, leaves, or moves >800 studs, it turns OFF cleanly without jumping.
+    - Zero emojis, zero third-party references.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+local Camlock = {
+    Enabled = false,
+    Active = false,
+    Keybind = "C",
+    CameraFOV = 70,
+    Smoothness = 1,
+    MaxDistance = 800,
+    Target = nil,
+    RenderConn = nil,
+    InputConn = nil,
+}
+
+local function isEnemy(player)
+    if not player or player == LocalPlayer then return false end
+    local myChar = LocalPlayer.Character
+    if not myChar then return false end
+
+    local myTeam = LocalPlayer.Team
+    local theirTeam = player.Team
+    if myTeam and theirTeam and myTeam == theirTeam and myTeam.Name == "Marines" then
+        return false
+    end
+    return true
+end
+
+local function isAlive(char)
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0
+end
+
+-- Find the target enemy: crosshair priority first, then closest in world (v2.5/2.6 standard)
+local function findTarget()
+    local myChar = LocalPlayer.Character
+    local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return nil, nil end
+
+    local cam = Workspace.CurrentCamera or Camera
+    local maxDist = Camlock.MaxDistance or 800
+    local bestPlayer = nil
+    local bestPart = nil
+    local shortestScreenDist = math.huge
+
+    local vpX = (cam and cam.ViewportSize and cam.ViewportSize.X) or 1920
+    local vpY = (cam and cam.ViewportSize and cam.ViewportSize.Y) or 1080
+    local centerX = vpX / 2
+    local centerY = vpY / 2
+
+    -- Pass 1: Enemy on screen closest to crosshair / center
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and isEnemy(p) and isAlive(p.Character) then
+            local hrp = p.Character:FindFirstChild("HumanoidRootPart") or p.Character:FindFirstChild("Head")
+            if hrp then
+                local worldDist = (hrp.Position - myHRP.Position).Magnitude
+                if worldDist <= maxDist then
+                    local onScreen = true
+                    local screenDist = worldDist
+
+                    if cam and cam.WorldToViewportPoint then
+                        local ok, sp, vis = pcall(function() return cam:WorldToViewportPoint(hrp.Position) end)
+                        if ok and sp then
+                            onScreen = (vis == true) or (sp.Z and sp.Z > 0)
+                            if onScreen and sp.X and sp.Y then
+                                local dx = sp.X - centerX
+                                local dy = sp.Y - centerY
+                                screenDist = math.sqrt(dx * dx + dy * dy)
+                            end
+                        end
+                    end
+
+                    if onScreen and screenDist < shortestScreenDist then
+                        shortestScreenDist = screenDist
+                        bestPlayer = p
+                        bestPart = hrp
+                    end
+                end
+            end
+        end
+    end
+
+    if bestPlayer and bestPart then
+        return bestPlayer, bestPart
+    end
+
+    -- No enemy on screen in front of player: do NOT lock onto anyone in world
+    return nil, nil
+end
+
+-- Stop locking: disconnects loop, frees camera completely to 100% normal
+function Camlock.Unlock()
+    if Camlock.RenderConn then
+        pcall(function() Camlock.RenderConn:Disconnect() end)
+        Camlock.RenderConn = nil
+    end
+
+    Camlock.Active = false
+    Camlock.Target = nil
+    _G.DarlingX_Camlock = false
+    _G.DarlingX_CamlockTargetName = nil
+
+    local ew = _G.DarlingX_ExtraWidgets
+    if ew and ew.UpdateCamlockVisual then
+        pcall(ew.UpdateCamlockVisual, false)
+    end
+
+    pcall(function()
+        local cam = Workspace.CurrentCamera or Camera
+        if cam and LocalPlayer and LocalPlayer.Character then
+            local char = LocalPlayer.Character
+            local hum = (char.FindFirstChildOfClass and char:FindFirstChildOfClass("Humanoid")) or (char.FindFirstChild and char:FindFirstChild("Humanoid"))
+            if hum and cam.CameraSubject ~= hum then
+                cam.CameraSubject = hum
+            end
+        end
+    end)
+
+    return false
+end
+
+-- Start locking: locks onto the target under crosshair and tracks them until turned off
+function Camlock.Lock(targetPlayer, targetPart)
+    if not targetPlayer or not targetPart then
+        targetPlayer, targetPart = findTarget()
+    end
+
+    if not targetPlayer or not targetPart then
+        Camlock.Unlock()
+        return false
+    end
+
+    Camlock.Target = targetPlayer
+    Camlock.Active = true
+    _G.DarlingX_Camlock = true
+    _G.DarlingX_CamlockTargetName = targetPlayer.DisplayName or targetPlayer.Name
+
+    local ew = _G.DarlingX_ExtraWidgets
+    if ew and ew.UpdateCamlockVisual then
+        pcall(ew.UpdateCamlockVisual, true)
+    end
+
+    if Camlock.RenderConn then
+        pcall(function() Camlock.RenderConn:Disconnect() end)
+        Camlock.RenderConn = nil
+    end
+
+    -- Real-time tracking loop: tracks ONLY this specific target until turned off or target drops
+    Camlock.RenderConn = RunService.RenderStepped:Connect(function()
+        if not Camlock.Active or not _G.DarlingX_Camlock then
+            Camlock.Unlock()
+            return
+        end
+
+        local tPlayer = Camlock.Target
+        if not tPlayer or not tPlayer.Character or not isAlive(tPlayer.Character) then
+            -- Target died or left: release camera cleanly, DO NOT jump to someone else
+            Camlock.Unlock()
+            return
+        end
+
+        local myChar = LocalPlayer.Character
+        local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+        local eHRP = tPlayer.Character:FindFirstChild("HumanoidRootPart") or tPlayer.Character:FindFirstChild("Head")
+
+        if not myHRP or not eHRP then
+            Camlock.Unlock()
+            return
+        end
+
+        local dist = (eHRP.Position - myHRP.Position).Magnitude
+        if dist > Camlock.MaxDistance then
+            -- Out of range: release camera cleanly
+            Camlock.Unlock()
+            return
+        end
+
+        local cam = Workspace.CurrentCamera or Camera
+        if cam and eHRP.Position then
+            local camPos = cam.CFrame.Position
+            local aimPos = eHRP.Position + Vector3.new(0, 1.5, 0)
+            if (camPos.X == camPos.X) and (aimPos.X == aimPos.X) and (aimPos - camPos).Magnitude > 0.5 then
+                pcall(function()
+                    if Camlock.Smoothness and Camlock.Smoothness < 1 and Camlock.Smoothness > 0 then
+                        cam.CFrame = cam.CFrame:Lerp(CFrame.new(camPos, aimPos), Camlock.Smoothness)
+                    else
+                        cam.CFrame = CFrame.new(camPos, aimPos)
+                    end
+                end)
+            end
+        end
+    end)
+
+    return true
+end
+
+-- Toggle function: flips cleanly between Lock and Unlock
+function Camlock.Toggle()
+    if Camlock.Active or _G.DarlingX_Camlock then
+        return Camlock.Unlock()
+    else
+        return Camlock.Lock()
+    end
+end
+
+-- Master enable: shows widget, but starts with camera lock in OFF state
+function Camlock.SetEnabled(state)
+    Camlock.Enabled = (state == true)
+    _G.DarlingX_CamlockEnabled = Camlock.Enabled
+
+    local ew = _G.DarlingX_ExtraWidgets
+    if ew and ew.SetCamlockWidgetVisible then
+        pcall(ew.SetCamlockWidgetVisible, Camlock.Enabled)
+    end
+
+    -- Always unlock camera when master toggle changes
+    Camlock.Unlock()
+
+    if _G.DarlingX_SyncCamlockUI then
+        pcall(_G.DarlingX_SyncCamlockUI, Camlock.Enabled)
+    end
+end
+
+-- Backward-compatibility aliases
+function Camlock.SetActive(state)
+    if state then
+        return Camlock.Lock()
+    else
+        return Camlock.Unlock()
+    end
+end
+
+function Camlock.ToggleActive()
+    return Camlock.Toggle()
+end
+
+function Camlock.StartLoop()
+    return Camlock.Lock()
+end
+
+function Camlock.StopLoop()
+    return Camlock.Unlock()
+end
+
+function Camlock.SetKeybind(key)
+    Camlock.Keybind = tostring(key or "None")
+end
+
+function Camlock.SetCameraFOV(val)
+    local num = tonumber(val) or 70
+    Camlock.CameraFOV = num
+    local cam = Workspace.CurrentCamera or Camera
+    if cam then
+        cam.FieldOfView = num
+    end
+end
+
+function Camlock.SetSmoothness(val)
+    Camlock.Smoothness = tonumber(val) or 1
+end
+
+-- Keybind listener
+local function setupInputHook()
+    if Camlock.InputConn then return end
+    Camlock.InputConn = UserInputService.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        local key = input.KeyCode.Name
+        if Camlock.Keybind ~= "None" and key == Camlock.Keybind then
+            Camlock.Toggle()
+        end
+    end)
+end
+
+setupInputHook()
+
+_G.DarlingX_CamlockMod = Camlock
+_G.DarlingX_ToggleCamlock = function() return Camlock.Toggle() end
+_G.DarlingX_SetCamlock = function(s) return Camlock.SetActive(s) end
+
+return Camlock
+--[[
+    Darling X - Dragon Gun M1 Ultra Fast Engine
+    Exact upvalue resolution and RenderStepped burst loop.
+    Zero emojis, zero third-party references.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+_G.G_DragonGunM1 = false
+_G.G_AttackMobs = true
+_G.G_AttackPlayers = true
+_G.G_AttackSeaEvents = true
+_G.G_MaxDistance = 400
+_G.G_ShotsPerFrame = 3
+
+local Modules = ReplicatedStorage:WaitForChild("Modules", 5)
+local DragonNet = Modules and Modules:WaitForChild("Net", 5)
+local ShootGunEvent = DragonNet and DragonNet:WaitForChild("RE/ShootGunEvent", 5)
+local Validator2 = ReplicatedStorage:WaitForChild("Remotes", 5):WaitForChild("Validator2", 5)
+
+local getupval = debug.getupvalue or getupvalue
+local setupval = debug.setupvalue or setupvalue
+local getupvals = debug.getupvalues or getupvalues
+
+local ShootFunction
+local V_Idx = { v26 = 12, v22 = 13, v25 = 14, v21 = 15, v23 = 16, v24 = 17, v27 = 18 }
+
+local function InitDragonGun()
+    local success, result = pcall(require, ReplicatedStorage:WaitForChild("Controllers"):WaitForChild("CombatController"))
+    if success and type(result) == "table" and result.Attack then
+        ShootFunction = getupval(result.Attack, 9)
+    end
+end
+
+local function GetNextValidator()
+    if not ShootFunction then InitDragonGun() end
+    if not ShootFunction then return 0, 0 end
+    local upvals = getupvals(ShootFunction)
+    if not upvals then return 0, 0 end
+    
+    if upvals[V_Idx.v21] ~= 727595 then
+        for i, v in pairs(upvals) do
+            if v == 727595 then
+                local offset = i - 15
+                V_Idx.v21 = i; V_Idx.v22 = 13 + offset; V_Idx.v23 = 16 + offset
+                V_Idx.v24 = 17 + offset; V_Idx.v26 = 12 + offset; V_Idx.v25 = 14 + offset
+                V_Idx.v27 = 18 + offset
+                break
+            end
+        end
+    end
+    
+    local v1 = getupval(ShootFunction, V_Idx.v21)
+    local v2 = getupval(ShootFunction, V_Idx.v22)
+    local v3 = getupval(ShootFunction, V_Idx.v23)
+    local v4 = getupval(ShootFunction, V_Idx.v24)
+    local v5 = getupval(ShootFunction, V_Idx.v25)
+    local v6 = getupval(ShootFunction, V_Idx.v26)
+    local v7 = getupval(ShootFunction, V_Idx.v27)
+    
+    if not (v1 and v2 and v3 and v4 and v5 and v6 and v7) then return 0, 0 end
+    
+    local v8 = v6 * v2
+    local v9 = (v5 * v2 + v6 * v1) % v3
+    v9 = (v9 * v3 + v8) % v4
+    v5 = math.floor(v9 / v3)
+    v6 = v9 - v5 * v3
+    v7 = v7 + 1
+    
+    setupval(ShootFunction, V_Idx.v25, v5)
+    setupval(ShootFunction, V_Idx.v26, v6)
+    setupval(ShootFunction, V_Idx.v27, v7)
+    return math.floor(v9 / v4 * 16777215), v7
+end
+
+local function GetEntityPart(entity)
+    return entity:FindFirstChild("HumanoidRootPart") 
+        or entity:FindFirstChild("Engine") 
+        or entity:FindFirstChild("Head") 
+        or entity:FindFirstChild("Base") 
+        or entity.PrimaryPart
+end
+
+local function GetClosestTarget()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    
+    local closest, dist = nil, _G.G_MaxDistance
+    local myPos = root.Position
+
+    if _G.G_AttackMobs then
+        local enemies = workspace:FindFirstChild("Enemies")
+        if enemies then
+            for _, enemy in ipairs(enemies:GetChildren()) do
+                local hum = enemy:FindFirstChildOfClass("Humanoid")
+                local r = GetEntityPart(enemy)
+                if hum and hum.Health > 0 and r then
+                    local d = (r.Position - myPos).Magnitude
+                    if d < dist then dist = d; closest = r end
+                end
+            end
+        end
+    end
+
+    if _G.G_AttackSeaEvents then
+        local seaFolders = { workspace:FindFirstChild("SeaBeasts"), workspace:FindFirstChild("SeaEvents") }
+        for _, folder in ipairs(seaFolders) do
+            if folder then
+                for _, seaMob in ipairs(folder:GetChildren()) do
+                    local hum = seaMob:FindFirstChildOfClass("Humanoid")
+                    local r = GetEntityPart(seaMob)
+                    if r and (not hum or hum.Health > 0) then
+                        local d = (r.Position - myPos).Magnitude
+                        if d < dist then dist = d; closest = r end
+                    end
+                end
+            end
+        end
+
+        for _, obj in ipairs(workspace:GetChildren()) do
+            if obj:IsA("Model") and obj ~= char then
+                local name = obj.Name:lower()
+                if name:find("ship") or name:find("boat") or name:find("beast") or name:find("terror") or name:find("piranha") or name:find("leviathan") then
+                    local hum = obj:FindFirstChildOfClass("Humanoid")
+                    local r = GetEntityPart(obj)
+                    if r and (not hum or hum.Health > 0) then
+                        local d = (r.Position - myPos).Magnitude
+                        if d < dist then dist = d; closest = r end
+                    end
+                end
+            end
+        end
+    end
+
+    if _G.G_AttackPlayers then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Character then
+                local hum = player.Character:FindFirstChildOfClass("Humanoid")
+                local r = player.Character:FindFirstChild("HumanoidRootPart")
+                if hum and hum.Health > 0 and r then
+                    local d = (r.Position - myPos).Magnitude
+                    if d < dist then dist = d; closest = r end
+                end
+            end
+        end
+    end
+
+    return closest
+end
+
+-- RenderStepped attack loop
+RunService.RenderStepped:Connect(function()
+    if not _G.G_DragonGunM1 then return end
+    
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    
+    if tool and tool.ToolTip == "Gun" then
+        local target = GetClosestTarget()
+        if target then
+            for i = 1, _G.G_ShotsPerFrame do
+                local code, count = GetNextValidator()
+                if code ~= 0 and Validator2 then 
+                    Validator2:FireServer(code, count) 
+                end
+                
+                tool:SetAttribute("LocalOverheat", 0)
+                tool:SetAttribute("LocalTotalShots", (tool:GetAttribute("LocalTotalShots") or 0) + 1)
+                
+                if ShootGunEvent then
+                    ShootGunEvent:FireServer(target.Position, { target })
+                end
+            end
+        end
+    end
+end)
+
+local function getWidgets()
+    if rawget(_G, "DarlingX_ExtraWidgets") then
+        return _G.DarlingX_ExtraWidgets
+    end
+    local hub = rawget(_G, "DarlingHub") or (getgenv and getgenv().DarlingHub)
+    if hub and hub.Require then
+        local w = hub:Require("modules/pvp/extra_widgets.lua")
+        if w then return w end
+    end
+    local req = (typeof(require) == "function") and require
+    if req and script and script.Parent then
+        local ok, w = pcall(req, script.Parent.extra_widgets)
+        if ok and w then return w end
+    end
+    return nil
+end
+
+-- Keybind G support
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.G and _G.DarlingX_DragonM1Enabled then
+        _G.G_DragonGunM1 = not _G.G_DragonGunM1
+        local widgets = getWidgets()
+        if widgets and widgets.UpdateDragonM1Visual then
+            widgets.UpdateDragonM1Visual(_G.G_DragonGunM1)
+        end
+    end
+end)
+
+local DragonGunModule = {
+    SetEnabled = function(state)
+        _G.G_DragonGunM1 = (state == true)
+        local widgets = getWidgets()
+        if widgets and widgets.UpdateDragonM1Visual then
+            widgets.UpdateDragonM1Visual(_G.G_DragonGunM1)
+        end
+    end,
+    SetWidgetVisible = function(state)
+        local widgets = getWidgets()
+        if widgets and widgets.SetDragonM1WidgetVisible then
+            widgets.SetDragonM1WidgetVisible(state == true)
+        end
+    end,
+    UpdateVisual = function(state)
+        local widgets = getWidgets()
+        if widgets and widgets.UpdateDragonM1Visual then
+            widgets.UpdateDragonM1Visual(state)
+        end
+    end,
+}
+
+return DragonGunModule
+--[[
+    Darling X - Unified Luxury Dark Glass Floating Widgets
+    Consolidated draggable floating widgets for:
+      1. Super Jump (Impulse Trigger)
+      2. Camlock (Aim Lock Toggle)
+      3. Dragon Gun M1 (Fast Gun Toggle)
+      4. Sanguine Boost (Velocity Dash Trigger)
+    Features:
+      - Clean transparent dark glass styling
+      - 6-stud drag threshold (separating drag from click)
+      - Feature-gating (taps only function when menu toggle is enabled)
+      - DisplayOrder 99999, safe parenting, touch and mouse support
+      - Zero emojis, zero third-party references
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+local function getGuiParent()
+    local ok, h = pcall(function() return gethui and gethui() end)
+    if ok and h and ((typeof and typeof(h) == "Instance") or type(h) == "userdata" or type(h) == "table") then return h end
+    local ok2, c = pcall(function() return CoreGui end)
+    if ok2 and c and ((typeof and typeof(c) == "Instance") or type(c) == "userdata" or type(c) == "table") then
+        local pOk = pcall(function()
+            local t = Instance.new("Folder")
+            t.Parent = c
+            t:Destroy()
+        end)
+        if pOk then return c end
+    end
+    local lp = LocalPlayer or Players.LocalPlayer
+    if lp then
+        local pg = nil
+        pcall(function()
+            pg = lp:FindFirstChildOfClass("PlayerGui") or lp:FindFirstChild("PlayerGui")
+        end)
+        if pg then return pg end
+        pcall(function()
+            pg = lp:WaitForChild("PlayerGui", 2)
+        end)
+        if pg then return pg end
+    end
+    return nil
+end
+
+local function ensureParent(gui)
+    if not gui then return end
+    local p = getGuiParent()
+    if p and gui.Parent ~= p then
+        pcall(function() gui.Parent = p end)
+    end
+end
+
+local function makeDraggable(targetFrame, dragHandle, onClick)
+    dragHandle = dragHandle or targetFrame
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+    local startTime = 0
+    local isDrag = false
+    local lastClickTick = 0
+
+    local function fireClick()
+        local now = os.clock()
+        if now - lastClickTick < 0.25 then return end
+        lastClickTick = now
+        if onClick then
+            pcall(onClick)
+        end
+    end
+
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            isDrag = false
+            dragStart = input.Position
+            startPos = targetFrame.Position
+            startTime = os.clock()
+        end
+    end)
+
+    dragHandle.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            if dragStart and startPos then
+                local delta = input.Position - dragStart
+                if delta.Magnitude > 28 then
+                    isDrag = true
+                    targetFrame.Position = UDim2.new(
+                        startPos.X.Scale,
+                        startPos.X.Offset + delta.X,
+                        startPos.Y.Scale,
+                        startPos.Y.Offset + delta.Y
+                    )
+                end
+            end
+        end
+    end)
+
+    dragHandle.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if dragging then
+                dragging = false
+                local duration = os.clock() - startTime
+                local totalDist = dragStart and (input.Position - dragStart).Magnitude or 0
+                if not isDrag or totalDist < 25 or duration < 0.28 then
+                    fireClick()
+                end
+            end
+        end
+    end)
+
+    pcall(function()
+        if dragHandle:IsA("GuiButton") or dragHandle.Activated then
+            dragHandle.Activated:Connect(function()
+                if not isDrag then
+                    fireClick()
+                end
+            end)
+        end
+    end)
+
+    pcall(function()
+        if dragHandle:IsA("GuiButton") then
+            dragHandle.MouseButton1Click:Connect(function()
+                if not isDrag then
+                    fireClick()
+                end
+            end)
+        end
+    end)
+end
+
+local function createGlassWidget(name, size, pos)
+    local gui = Instance.new("ScreenGui")
+    gui.Name = name
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 99999
+    gui.IgnoreGuiInset = true
+    gui.Enabled = false
+    pcall(function()
+        if syn and syn.protect_gui then syn.protect_gui(gui) end
+        gui.Parent = getGuiParent()
+    end)
+
+    local container = Instance.new("Frame", gui)
+    container.Name = name .. "_Container"
+    container.Size = size
+    container.Position = pos
+    container.BackgroundColor3 = Color3.fromRGB(18, 14, 28)
+    container.BackgroundTransparency = 0.45
+    container.Active = true
+
+    local corner = Instance.new("UICorner", container)
+    corner.CornerRadius = UDim.new(0, 10)
+
+    local stroke = Instance.new("UIStroke", container)
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Thickness = 1.0
+    stroke.Transparency = 0.6
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+    local btn = Instance.new("TextButton", container)
+    btn.Name = name .. "_Btn"
+    btn.Size = UDim2.new(1, -6, 1, -6)
+    btn.Position = UDim2.new(0, 3, 0, 3)
+    btn.BackgroundColor3 = Color3.fromRGB(48, 38, 72)
+    btn.BackgroundTransparency = 0.5
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 11
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.AutoButtonColor = false
+
+    local btnCorner = Instance.new("UICorner", btn)
+    btnCorner.CornerRadius = UDim.new(0, 8)
+
+    return gui, container, btn
+end
+
+-- 1. Super Jump Widget
+local SuperJumpUI = nil
+local jumpBtnRef = nil
+
+local function doSuperJump()
+    if not _G.DarlingX_SuperJump then return end
+    pcall(function()
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local force = _G.DarlingX_SuperJumpPower or 216
+            hrp.AssemblyLinearVelocity = Vector3.new(hrp.AssemblyLinearVelocity.X, force, hrp.AssemblyLinearVelocity.Z)
+        end
+    end)
+end
+
+local function initSuperJumpUI()
+    if SuperJumpUI and SuperJumpUI.Parent then return end
+    local gui, container, btn = createGlassWidget("SuperJumpWidget", UDim2.new(0, 92, 0, 38), UDim2.new(0.85, 0, 0.58, 0))
+    SuperJumpUI = gui
+    jumpBtnRef = btn
+    btn.Text = "JUMP"
+    btn.TextSize = 12
+
+    makeDraggable(container, btn, function()
+        doSuperJump()
+    end)
+end
+
+-- 2. Camlock Widget
+local CamlockUI = nil
+local lockBtnRef = nil
+
+local function updateLockVisual(state)
+    if not lockBtnRef then return end
+    local active = (state ~= nil) and state or (_G.DarlingX_Camlock == true)
+    if active then
+        lockBtnRef.BackgroundColor3 = Color3.fromRGB(0, 180, 80)
+        lockBtnRef.BackgroundTransparency = 0.2
+        local targetName = rawget(_G, "DarlingX_CamlockTargetName")
+        if targetName and tostring(targetName) ~= "" then
+            local cleanName = tostring(targetName)
+            if #cleanName > 8 then
+                cleanName = cleanName:sub(1, 7) .. ".."
+            end
+            lockBtnRef.Text = "LOCK: " .. cleanName
+        else
+            lockBtnRef.Text = "LOCK: ON"
+        end
+    else
+        lockBtnRef.BackgroundColor3 = Color3.fromRGB(36, 30, 50)
+        lockBtnRef.BackgroundTransparency = 0.5
+        lockBtnRef.Text = "LOCK: OFF"
+    end
+end
+
+
+local function initCamlockUI()
+    if CamlockUI and CamlockUI.Parent then return end
+    local gui, container, btn = createGlassWidget("CamlockWidget", UDim2.new(0, 96, 0, 38), UDim2.new(0.85, 0, 0.50, 0))
+    CamlockUI = gui
+    lockBtnRef = btn
+    updateLockVisual(false)
+
+    makeDraggable(container, btn, function()
+        if _G.DarlingX_CamlockMod and _G.DarlingX_CamlockMod.Toggle then
+            _G.DarlingX_CamlockMod.Toggle()
+        elseif _G.DarlingX_ToggleCamlock then
+            _G.DarlingX_ToggleCamlock()
+        else
+            local cl = rawget(_G, "DarlingX_GetModule") and _G.DarlingX_GetModule("modules/pvp/camlock.lua")
+            if cl and cl.Toggle then
+                cl.Toggle()
+            end
+        end
+    end)
+end
+
+-- 3. Dragon Gun M1 Widget
+local DragonM1UI = nil
+local m1BtnRef = nil
+
+local function updateDragonM1Visual(state)
+    if not m1BtnRef then return end
+    local active = (state ~= nil) and state or (_G.G_DragonGunM1 == true)
+    if active then
+        m1BtnRef.BackgroundColor3 = Color3.fromRGB(0, 190, 90)
+        m1BtnRef.BackgroundTransparency = 0.3
+        m1BtnRef.Text = "M1: ON"
+    else
+        m1BtnRef.BackgroundColor3 = Color3.fromRGB(48, 38, 72)
+        m1BtnRef.BackgroundTransparency = 0.5
+        m1BtnRef.Text = "M1: OFF"
+    end
+end
+
+local function initDragonM1UI()
+    if DragonM1UI and DragonM1UI.Parent then return end
+    local gui, container, btn = createGlassWidget("DragonM1Widget", UDim2.new(0, 96, 0, 38), UDim2.new(0.85, 0, 0.42, 0))
+    DragonM1UI = gui
+    m1BtnRef = btn
+    updateDragonM1Visual()
+
+    makeDraggable(container, btn, function()
+        if not _G.DarlingX_DragonM1Enabled then return end
+        _G.G_DragonGunM1 = not _G.G_DragonGunM1
+        updateDragonM1Visual(_G.G_DragonGunM1)
+    end)
+end
+
+-- 4. Sanguine Boost Widget
+local SanguineUI = nil
+local sanguineBtnRef = nil
+local sanguinePulseActive = false
+
+local function doSanguineBoost()
+    if not _G.DarlingX_SanguineBoost then return end
+    pcall(function()
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+
+        local cam = Workspace.CurrentCamera
+        local dir = cam and cam.CFrame.LookVector or hrp.CFrame.LookVector
+        local power = 400
+        local duration = 0.9
+
+        local att = Instance.new("Attachment", hrp)
+        local lv = Instance.new("LinearVelocity", hrp)
+        lv.MaxForce = math.huge
+        lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+        lv.VectorVelocity = dir * power
+        lv.Attachment0 = att
+
+        task.delay(duration, function()
+            if lv and lv.Parent then lv:Destroy() end
+            if att and att.Parent then att:Destroy() end
+        end)
+    end)
+end
+
+local function updateSanguineVisual(isBoosting)
+    if not sanguineBtnRef then return end
+    if isBoosting then
+        sanguineBtnRef.BackgroundColor3 = Color3.fromRGB(0, 220, 100)
+        sanguineBtnRef.BackgroundTransparency = 0.2
+        sanguineBtnRef.Text = "BOOST!"
+    else
+        sanguineBtnRef.BackgroundColor3 = Color3.fromRGB(110, 45, 170)
+        sanguineBtnRef.BackgroundTransparency = 0.4
+        sanguineBtnRef.Text = "BOOST Z"
+    end
+end
+
+local function triggerSanguineAction()
+    if not _G.DarlingX_SanguineBoost or sanguinePulseActive then return end
+    sanguinePulseActive = true
+    doSanguineBoost()
+    updateSanguineVisual(true)
+    task.delay(0.35, function()
+        updateSanguineVisual(false)
+        sanguinePulseActive = false
+    end)
+end
+
+local function initSanguineUI()
+    if SanguineUI and SanguineUI.Parent then return end
+    local gui, container, btn = createGlassWidget("SanguineWidget", UDim2.new(0, 92, 0, 38), UDim2.new(0.85, 0, 0.34, 0))
+    SanguineUI = gui
+    sanguineBtnRef = btn
+    updateSanguineVisual(false)
+
+    makeDraggable(container, btn, function()
+        triggerSanguineAction()
+    end)
+end
+
+-- Initialize widgets lazily on startup
+initSuperJumpUI()
+initCamlockUI()
+initDragonM1UI()
+initSanguineUI()
+
+local Widgets = {
+    -- Super Jump
+    SetSuperJumpWidgetVisible = function(state)
+        if not SuperJumpUI or not SuperJumpUI.Parent then initSuperJumpUI() end
+        if SuperJumpUI then
+            ensureParent(SuperJumpUI)
+            SuperJumpUI.Enabled = (state == true)
+        end
+    end,
+    DoSuperJump = doSuperJump,
+
+    -- Camlock
+    SetCamlockWidgetVisible = function(state)
+        if not CamlockUI or not CamlockUI.Parent then initCamlockUI() end
+        if CamlockUI then
+            ensureParent(CamlockUI)
+            CamlockUI.Enabled = (state == true)
+            updateLockVisual(false)
+        end
+    end,
+    UpdateCamlockVisual = updateLockVisual,
+
+    -- Dragon Gun M1
+    SetDragonM1WidgetVisible = function(state)
+        if not DragonM1UI or not DragonM1UI.Parent then initDragonM1UI() end
+        if DragonM1UI then
+            ensureParent(DragonM1UI)
+            DragonM1UI.Enabled = (state == true)
+            updateDragonM1Visual()
+        end
+    end,
+    UpdateDragonM1Visual = updateDragonM1Visual,
+
+    -- Sanguine Boost
+    SetSanguineWidgetVisible = function(state)
+        if not SanguineUI or not SanguineUI.Parent then initSanguineUI() end
+        if SanguineUI then
+            ensureParent(SanguineUI)
+            SanguineUI.Enabled = (state == true)
+            updateSanguineVisual(false)
+        end
+    end,
+    UpdateSanguineVisual = updateSanguineVisual,
+    DoSanguineBoost = triggerSanguineAction,
+}
+
+_G.DarlingX_ExtraWidgets = Widgets
+return Widgets
+--[[
+    Darling X - Fast Attack Engine
+    Classic high-speed M1 Fast Attack for Blox Fruits.
+    Autonomous remote resolution, direct held tool detection, and Stepped burst firing.
+    Zero emojis, zero third-party references.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+local FastAttack = {
+    Enabled = false,
+    Distance = 85,
+    ClickDelay = 0,
+    Running = false,
+}
+
+local RegisterAttack = nil
+local RegisterHit = nil
+
+local function resolveRemotes()
+    if RegisterAttack and RegisterHit then return true end
+    pcall(function()
+        local net = ReplicatedStorage:FindFirstChild("Modules") and ReplicatedStorage.Modules:FindFirstChild("Net")
+        if net then
+            RegisterAttack = net:FindFirstChild("RE/RegisterAttack") or net:FindFirstChild("RegisterAttack")
+            RegisterHit = net:FindFirstChild("RE/RegisterHit") or net:FindFirstChild("RegisterHit")
+        end
+        if not (RegisterAttack and RegisterHit) then
+            for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
+                if v:IsA("RemoteEvent") then
+                    if v.Name == "RE/RegisterHit" or v.Name == "RegisterHit" then
+                        RegisterHit = v
+                    elseif v.Name == "RE/RegisterAttack" or v.Name == "RegisterAttack" then
+                        RegisterAttack = v
+                    end
+                end
+                if RegisterHit and RegisterAttack then break end
+            end
+        end
+    end)
+    return (RegisterAttack ~= nil and RegisterHit ~= nil)
+end
+
+resolveRemotes()
+
+local function isAlive(char)
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0
+end
+
+local function collectEnemies()
+    local char = LocalPlayer.Character
+    local root = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
+    if not root then return nil, {} end
+
+    local myPos = root.Position
+    local enemiesList = {}
+    local basePart = nil
+    local shortestDist = FastAttack.Distance
+
+    local function processFolder(folder)
+        if not folder then return end
+        for _, enemy in ipairs(folder:GetChildren()) do
+            if enemy ~= char and isAlive(enemy) then
+                local head = enemy:FindFirstChild("Head") or enemy:FindFirstChild("HumanoidRootPart")
+                if head then
+                    local d = (head.Position - myPos).Magnitude
+                    if d <= FastAttack.Distance then
+                        table.insert(enemiesList, { enemy, head })
+                        if d < shortestDist then
+                            shortestDist = d
+                            basePart = head
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    processFolder(Workspace:FindFirstChild("Enemies"))
+    processFolder(Workspace:FindFirstChild("Characters"))
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local enemyChar = p.Character
+            if isAlive(enemyChar) then
+                local head = enemyChar:FindFirstChild("Head") or enemyChar:FindFirstChild("HumanoidRootPart")
+                if head then
+                    local d = (head.Position - myPos).Magnitude
+                    if d <= FastAttack.Distance then
+                        table.insert(enemiesList, { enemyChar, head })
+                        if d < shortestDist then
+                            shortestDist = d
+                            basePart = head
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return basePart, enemiesList
+end
+
+local function performAttack(basePart, enemiesList)
+    if not basePart or #enemiesList == 0 then return end
+    resolveRemotes()
+    if RegisterAttack then
+        pcall(function() RegisterAttack:FireServer(FastAttack.ClickDelay) end)
+    end
+    if RegisterHit then
+        pcall(function() RegisterHit:FireServer(basePart, enemiesList) end)
+    end
+end
+
+local attackThread = nil
+
+function FastAttack.enable()
+    FastAttack.Enabled = true
+    if attackThread then return end
+    attackThread = task.spawn(function()
+        while FastAttack.Enabled do
+            task.wait(0.05)
+            pcall(function()
+                local char = LocalPlayer.Character
+                if not char then return end
+
+                local tool = char:FindFirstChildOfClass("Tool")
+                if not tool or tool.ToolTip == "Gun" then return end
+
+                local basePart, enemiesList = collectEnemies()
+                if basePart and #enemiesList > 0 then
+                    performAttack(basePart, enemiesList)
+                end
+            end)
+        end
+        attackThread = nil
+    end)
+end
+
+function FastAttack.disable()
+    FastAttack.Enabled = false
+    if attackThread then
+        task.cancel(attackThread)
+        attackThread = nil
+    end
+end
+
+function FastAttack.toggle(state)
+    if state == nil then state = not FastAttack.Enabled end
+    if state then FastAttack.enable() else FastAttack.disable() end
+end
+
+return FastAttack
+--[[
+    Darling X - Floating Widget Framework
+    Movable on-screen pill buttons and toggles with touch and drag support.
+    Zero emojis, zero third-party references.
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local FloatingWidget = {
+    Locked = false,
+    AllWidgets = {},
+}
+FloatingWidget.__index = FloatingWidget
+
+local function getGuiContainer()
+    local ok, h = pcall(function() return gethui and gethui() end)
+    if ok and h and typeof(h) == "Instance" then return h end
+    local ok2, c = pcall(function() return CoreGui end)
+    if ok2 and c and typeof(c) == "Instance" then
+        local pOk = pcall(function()
+            local t = Instance.new("Folder")
+            t.Parent = c
+            t:Destroy()
+        end)
+        if pOk then return c end
+    end
+    local lp = LocalPlayer or Players.LocalPlayer
+    return lp and (lp:FindFirstChildOfClass("PlayerGui") or lp:WaitForChild("PlayerGui", 3))
+end
+
+local SharedScreenGui = nil
+
+local function getSharedScreenGui()
+    if SharedScreenGui and SharedScreenGui.Parent then
+        return SharedScreenGui
+    end
+
+    local parent = getGuiContainer()
+    local existing = parent and parent:FindFirstChild("DarlingFloatingWidgets")
+    if existing then
+        SharedScreenGui = existing
+        return SharedScreenGui
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "DarlingFloatingWidgets"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 2147482000
+    if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
+    pcall(function() gui.Parent = parent end)
+    SharedScreenGui = gui
+    return SharedScreenGui
+end
+
+function FloatingWidget.LockAll(locked)
+    FloatingWidget.Locked = (locked == true)
+end
+
+function FloatingWidget.create(config)
+    config = config or {}
+    local id = config.Id or ("Widget_" .. tostring(os.clock()))
+    local label = config.Label or config.Title or "ACT"
+    local widgetType = config.Type or "Toggle"
+    local enabled = config.Default == true
+    local accentColor = config.AccentColor or Color3.fromRGB(255, 255, 255)
+    local defaultPos = config.Position or UDim2.new(0.85, 0, 0.45, 0)
+    local callback = config.Callback or function() end
+    local uiElementKey = config.UIElementKey or id
+
+    local screenGui = getSharedScreenGui()
+
+    local oldPill = screenGui and screenGui:FindFirstChild(id)
+    if oldPill then pcall(function() oldPill:Destroy() end) end
+
+    local pill = Instance.new("TextButton")
+    pill.Name = id
+    pill.Size = UDim2.fromOffset(66, 36)
+    pill.AutomaticSize = Enum.AutomaticSize.X
+    pill.Position = defaultPos
+    pill.BackgroundColor3 = Color3.fromRGB(18, 14, 26)
+    pill.BackgroundTransparency = 0.25
+    pill.BorderSizePixel = 0
+    pill.AutoButtonColor = false
+    pill.Text = ""
+    pill.Active = true
+    pill.Visible = (config.Visible == true)
+    if screenGui then pcall(function() pill.Parent = screenGui end) end
+
+    local sizeConstraint = Instance.new("UISizeConstraint")
+    sizeConstraint.MinSize = Vector2.new(66, 36)
+    sizeConstraint.MaxSize = Vector2.new(200, 36)
+    sizeConstraint.Parent = pill
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingLeft = UDim.new(0, 10)
+    padding.PaddingRight = UDim.new(0, (widgetType == "Toggle" and 18 or 10))
+    padding.PaddingTop = UDim.new(0, 2)
+    padding.PaddingBottom = UDim.new(0, 2)
+    padding.Parent = pill
+
+    local pillCorner = Instance.new("UICorner")
+    pillCorner.CornerRadius = UDim.new(0, 10)
+    pillCorner.Parent = pill
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Name = "Stroke"
+    stroke.Color = enabled and accentColor or Color3.fromRGB(50, 42, 68)
+    stroke.Thickness = 1.2
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = pill
+
+    local textLabel = Instance.new("TextLabel")
+    textLabel.Name = "Label"
+    textLabel.BackgroundTransparency = 1
+    textLabel.Size = UDim2.fromScale(1, 1)
+    textLabel.Font = Enum.Font.GothamBold
+    textLabel.TextSize = 10
+    textLabel.TextColor3 = enabled and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 175, 200)
+    textLabel.Text = label
+    textLabel.Parent = pill
+
+    local dot = nil
+    if widgetType == "Toggle" then
+        dot = Instance.new("Frame")
+        dot.Name = "StatusDot"
+        dot.Size = UDim2.fromOffset(6, 6)
+        dot.Position = UDim2.new(1, -6, 0.5, -3)
+        dot.BackgroundColor3 = enabled and accentColor or Color3.fromRGB(80, 75, 95)
+        dot.BorderSizePixel = 0
+        Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+        dot.Parent = pill
+    end
+
+    local self = setmetatable({
+        Id = id,
+        UIElementKey = uiElementKey,
+        Pill = pill,
+        Stroke = stroke,
+        TextLabel = textLabel,
+        Dot = dot,
+        Type = widgetType,
+        Enabled = enabled,
+        BaseLabel = label,
+        AccentColor = accentColor,
+        Callback = callback,
+        Connections = {},
+    }, FloatingWidget)
+
+    FloatingWidget.AllWidgets[id] = self
+
+    local function updateVisuals()
+        local isAct = self.Enabled
+        local col = isAct and self.AccentColor or Color3.fromRGB(50, 42, 68)
+        TweenService:Create(self.Stroke, TweenInfo.new(0.18), { Color = col }):Play()
+        if self.Dot then
+            local dotCol = isAct and self.AccentColor or Color3.fromRGB(80, 75, 95)
+            TweenService:Create(self.Dot, TweenInfo.new(0.18), { BackgroundColor3 = dotCol }):Play()
+        end
+        local txtCol = isAct and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 175, 200)
+        TweenService:Create(self.TextLabel, TweenInfo.new(0.18), { TextColor3 = txtCol }):Play()
+    end
+    self.UpdateVisuals = updateVisuals
+
+    -- Dragging Logic
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+    local startTime = 0
+
+    table.insert(self.Connections, pill.InputBegan:Connect(function(input)
+        if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and not FloatingWidget.Locked then
+            dragging = true
+            dragStart = input.Position
+            startPos = pill.Position
+            startTime = os.clock()
+        end
+    end))
+
+    table.insert(self.Connections, UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            pill.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+
+    table.insert(self.Connections, UserInputService.InputEnded:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            dragging = false
+            local movedDist = (input.Position - dragStart).Magnitude
+            local elapsed = os.clock() - startTime
+            if movedDist < 12 and elapsed < 0.4 then
+                if self.Type == "Action" then
+                    self:TriggerAction()
+                else
+                    self:Toggle()
+                end
+            end
+        end
+    end))
+
+    return self
+end
+
+function FloatingWidget:TriggerAction()
+    TweenService:Create(self.Pill, TweenInfo.new(0.08), { BackgroundTransparency = 0 }):Play()
+    task.delay(0.1, function()
+        TweenService:Create(self.Pill, TweenInfo.new(0.15), { BackgroundTransparency = 0.25 }):Play()
+    end)
+    if self.Callback then pcall(self.Callback) end
+end
+
+function FloatingWidget:Set(state, suppressCallback)
+    self.Enabled = (state == true)
+    self.UpdateVisuals()
+    if not suppressCallback and self.Callback then
+        pcall(self.Callback, self.Enabled)
+    end
+end
+
+function FloatingWidget:SetState(state)
+    self.Enabled = (state == true)
+    self.UpdateVisuals()
+end
+
+function FloatingWidget:Toggle()
+    self:Set(not self.Enabled)
+end
+
+function FloatingWidget:SetVisible(visible)
+    if self.Pill and self.Pill.Parent then
+        self.Pill.Visible = (visible == true)
+    end
+end
+
+function FloatingWidget:SetLabel(lbl)
+    self.BaseLabel = lbl
+    if self.TextLabel then self.TextLabel.Text = lbl end
+end
+
+function FloatingWidget:Destroy()
+    for _, conn in ipairs(self.Connections) do pcall(function() conn:Disconnect() end) end
+    table.clear(self.Connections)
+    if self.Pill and self.Pill.Parent then pcall(function() self.Pill:Destroy() end) end
+end
+
+function FloatingWidget.GetWidget(id)
+    return FloatingWidget.AllWidgets[id]
+end
+
+function FloatingWidget.SetWidgetVisible(id, visible)
+    local w = FloatingWidget.GetWidget(id)
+    if w then
+        w:SetVisible(visible)
+    end
+end
+
+return FloatingWidget
+--[[
+    Darling X - Sanguine Boost Z Module
+    Exact linear velocity impulse and Z keybind.
+    Linked to unified glass widget in extra_widgets.lua.
+    Zero emojis, zero third-party references.
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local camera = Workspace.CurrentCamera
+
+local velocityPower = 400
+local boostDuration = 0.9
+local isCooldown = false
+
+local function doBoost()
+    local character = player.Character
+    if not character then return end
+    
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local cam = Workspace.CurrentCamera or camera
+    local dir = cam and cam.CFrame.LookVector or hrp.CFrame.LookVector
+
+    local att = Instance.new("Attachment")
+    att.Parent = hrp
+
+    local lv = Instance.new("LinearVelocity")
+    lv.MaxForce = math.huge
+    lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+    lv.VectorVelocity = dir * velocityPower
+    lv.Attachment0 = att
+    lv.Parent = hrp
+
+    task.delay(boostDuration, function()
+        if lv and lv.Parent then lv:Destroy() end
+        if att and att.Parent then att:Destroy() end
+    end)
+end
+
+local function getWidgets()
+    if rawget(_G, "DarlingX_ExtraWidgets") then
+        return _G.DarlingX_ExtraWidgets
+    end
+    local hub = rawget(_G, "DarlingHub") or (getgenv and getgenv().DarlingHub)
+    if hub and hub.Require then
+        local w = hub:Require("modules/pvp/extra_widgets.lua")
+        if w then return w end
+    end
+    local req = (typeof(require) == "function") and require
+    if req and script and script.Parent then
+        local ok, w = pcall(req, script.Parent.extra_widgets)
+        if ok and w then return w end
+    end
+    return nil
+end
+
+local function triggerBoostWithVisual()
+    if isCooldown then return end
+    isCooldown = true
+
+    doBoost()
+
+    local widgets = getWidgets()
+    if widgets and widgets.UpdateSanguineVisual then
+        widgets.UpdateSanguineVisual(true)
+    end
+
+    task.delay(0.35, function()
+        local w = getWidgets()
+        if w and w.UpdateSanguineVisual then
+            w.UpdateSanguineVisual(false)
+        end
+        isCooldown = false
+    end)
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.Z and _G.DarlingX_SanguineBoost then
+        triggerBoostWithVisual()
+    end
+end)
+
+local SanguineModule = {
+    DoBoost = doBoost,
+    Trigger = triggerBoostWithVisual,
+    SetEnabled = function(state)
+        _G.DarlingX_SanguineBoost = (state == true)
+        local widgets = getWidgets()
+        if widgets and widgets.SetSanguineWidgetVisible then
+            widgets.SetSanguineWidgetVisible(state == true)
+        end
+    end,
+    SetWidgetVisible = function(state)
+        local widgets = getWidgets()
+        if widgets and widgets.SetSanguineWidgetVisible then
+            widgets.SetSanguineWidgetVisible(state == true)
+        end
+    end,
+}
+
+return SanguineModule
